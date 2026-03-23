@@ -210,12 +210,25 @@ class Bot:
                 break
 
             expiries = {u: len(self._orderbook.get_expiries(u)) for u in self._config.underlyings}
+            index_prices = {
+                u: float(self._orderbook.get_index_price(u) or 0)
+                for u in self._config.underlyings
+            }
+            spot_prices = {
+                u: float(self._orderbook.get_spot_price(u) or 0)
+                for u in self._config.underlyings
+            }
 
             logger.info(
                 "[STATS] quotes=%d | queue=%d | expiries=%s",
                 self._orderbook.quote_count,
                 self._quote_queue.qsize(),
                 expiries,
+            )
+            logger.info(
+                "[STATS] index_prices=%s | spot_prices=%s",
+                index_prices,
+                spot_prices,
             )
 
         logger.info("[STATS] Reporter stopped")
