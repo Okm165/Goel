@@ -218,7 +218,7 @@ class OrderBook:
         try:
             await asyncio.wait_for(self._update_event.wait(), timeout=timeout)
             return True
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 "[ORDERBOOK] Wait timeout after %.1fs | quotes=%d",
                 timeout,
@@ -280,3 +280,8 @@ class OrderBook:
     def instruments(self) -> list[str]:
         """List of all cached instrument names."""
         return list(self._quotes.keys())
+
+    @property
+    def quotes(self) -> list[Quote]:
+        """All option quotes as a flat list (excludes PERP instruments)."""
+        return list(self._quotes.values())
