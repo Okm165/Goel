@@ -147,21 +147,16 @@ class DeriveClient:
         session: aiohttp.ClientSession,
         currency: str,
     ) -> list[str]:
-        """Fetch option instruments for a currency."""
-        request_data = {
-            "jsonrpc": "2.0",
-            "id": int(time.time() * 1000),
-            "method": "public/get_instruments",
-            "params": {
-                "currency": currency,
-                "expired": False,
-                "instrument_type": "option",
-            },
+        """Fetch option instruments for a currency, plus the perp."""
+        params = {
+            "currency": currency,
+            "expired": "false",
+            "instrument_type": "option",
         }
 
-        async with session.post(
+        async with session.get(
             f"{REST_URL}/public/get_instruments",
-            json=request_data,
+            params=params,
         ) as response:
             data = await response.json()
 
@@ -170,14 +165,20 @@ class DeriveClient:
                 return []
 
             result = data.get("result", [])
-            return [inst["instrument_name"] for inst in result if inst.get("is_active")]
+            instruments = [inst["instrument_name"] for inst in result if inst.get("is_active")]
+
+        # Always include the perpetual for this currency so we can track the
+        # funding rate and use the perp mark price as a fallback forward proxy.
+        perp_name = f"{currency}-PERP"
+        instruments.append(perp_name)
+        return instruments
 
     async def _subscribe_all(self) -> None:
         """Subscribe to all instrument tickers."""
         if not self._ws or not self._instruments:
             return
 
-        channels = [f"ticker.{inst}.100ms" for inst in self._instruments]
+        channels = [f"ticker_slim.{inst}.100" for inst in self._instruments]
 
         for i in range(0, len(channels), 50):
             batch = channels[i : i + 50]
@@ -202,28 +203,40 @@ class DeriveClient:
         self._subscriptions.update(channels)
 
     async def _listen(self) -> None:
-        """Listen for incoming messages."""
+        """Listen for incoming messages with timeout protection."""
         if not self._ws:
             return
 
         message_count = 0
         last_log_time = time.monotonic()
+        recv_timeout = 30.0
 
-        async for raw_msg in self._ws:
-            self._last_message_time = time.monotonic()
-            message_count += 1
-
-            text = raw_msg.decode("utf-8") if isinstance(raw_msg, bytes) else raw_msg
-
-            if self._last_message_time - last_log_time > THROUGHPUT_LOG_INTERVAL:
-                logger.debug("[CLIENT] Messages: %d in 10s", message_count)
-                message_count = 0
-                last_log_time = self._last_message_time
-
+        while self._running:
             try:
-                self._handle_message(text)
-            except Exception:
-                logger.exception("[CLIENT] Error handling message")
+                raw_msg = await asyncio.wait_for(self._ws.recv(), timeout=recv_timeout)
+                self._last_message_time = time.monotonic()
+                message_count += 1
+
+                text = raw_msg.decode("utf-8") if isinstance(raw_msg, bytes) else raw_msg
+
+                if self._last_message_time - last_log_time > THROUGHPUT_LOG_INTERVAL:
+                    logger.info("[CLIENT] Messages: %d in %.0fs", message_count, THROUGHPUT_LOG_INTERVAL)
+                    message_count = 0
+                    last_log_time = self._last_message_time
+
+                try:
+                    self._handle_message(text)
+                except Exception:
+                    logger.exception("[CLIENT] Error handling message")
+
+            except asyncio.TimeoutError:
+                logger.warning("[CLIENT] No messages received in %.0fs", recv_timeout)
+                continue
+            except ConnectionClosed:
+                logger.warning("[CLIENT] Connection closed during listen")
+                break
+            except asyncio.CancelledError:
+                break
 
     def _handle_message(self, raw: str) -> None:
         """Parse and dispatch incoming message."""
@@ -236,40 +249,49 @@ class DeriveClient:
         params = data.get("params", {})
         channel = params.get("channel", "")
 
-        if channel.startswith("ticker."):
+        if channel.startswith("ticker_slim."):
             self._handle_ticker(channel, params.get("data", {}))
 
     def _handle_ticker(self, channel: str, data: dict[str, Any]) -> None:
         """Parse ticker data into Quote and push to queue.
 
-        TickerSlim format:
-        - a: best ask price
-        - b: best bid price
-        - A: ask amount
-        - B: bid amount
+        TickerSlim format (nested under instrument_ticker):
+        - a / b: best ask / bid price
+        - A / B: ask / bid amount
         - M: mark price
-        - t: timestamp
-        - option_pricing.i: IV
+        - I: index price (spot)
+        - f: current hourly funding rate (perps only; null for options)
+        - t: timestamp ms
+        - option_pricing.i: implied volatility
         - option_pricing.d: delta
+        - option_pricing.f: oracle forward price for this expiry (options only)
+          → This is the Block Scholes oracle forward: the ONLY correct basis for
+            put-call parity on Derive (protocol uses r=0, not a US-Treasury rate).
         """
         parts = channel.split(".")
         if len(parts) < 2:
             return
 
         instrument = parts[1]
-        option_pricing: dict[str, Any] = data.get("option_pricing") or {}
+        ticker: dict[str, Any] = data.get("instrument_ticker", {})
+        option_pricing: dict[str, Any] = ticker.get("option_pricing") or {}
 
         try:
             quote = Quote(
                 instrument=instrument,
-                bid=Decimal(str(data.get("b", "0"))),
-                bid_size=Decimal(str(data.get("B", "0"))),
-                ask=Decimal(str(data.get("a", "0"))),
-                ask_size=Decimal(str(data.get("A", "0"))),
-                mark=Decimal(str(data.get("M", "0"))),
+                bid=Decimal(str(ticker.get("b", "0"))),
+                bid_size=Decimal(str(ticker.get("B", "0"))),
+                ask=Decimal(str(ticker.get("a", "0"))),
+                ask_size=Decimal(str(ticker.get("A", "0"))),
+                mark=Decimal(str(ticker.get("M", "0"))),
                 iv=Decimal(str(option_pricing.get("i", "0"))),
                 delta=Decimal(str(option_pricing.get("d", "0"))),
-                timestamp_ms=int(data.get("t", 0)),
+                timestamp_ms=int(ticker.get("t", 0)),
+                index_price=Decimal(str(ticker.get("I", "0"))),
+                # Oracle forward price — present for options, zero for perps.
+                forward_price=Decimal(str(option_pricing.get("f", "0") or "0")),
+                # Hourly funding rate — present for perps, zero for options.
+                funding_rate=Decimal(str(ticker.get("f", "0") or "0")),
             )
 
             logger.debug("[CLIENT] Quote | %s | bid=%s ask=%s", instrument, quote.bid, quote.ask)
