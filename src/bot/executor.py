@@ -9,10 +9,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
-from decimal import Decimal
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 
@@ -262,7 +262,7 @@ class Executor:
     ) -> bool:
         """Re-validate MM quoted prices against the original profit threshold.
 
-        The market can move in the 0–2.5 s between scan and quote receipt.
+        The market can move in the 0-2.5 s between scan and quote receipt.
         This is the last safety gate before any capital leaves the account.
 
         Parses each quoted leg price and re-calculates the net credit.  If the
@@ -302,9 +302,9 @@ class Executor:
                 logger.warning("[EXECUTOR] Leg %s missing in quote response", leg.instrument)
                 return False  # Incomplete quote — do not execute
             if leg.side == Side.SELL:
-                quoted_gross += qp   # we receive this
+                quoted_gross += qp  # we receive this
             else:
-                quoted_gross -= qp   # we pay this
+                quoted_gross -= qp  # we pay this
 
         quoted_net = quoted_gross - opportunity.total_fees
         if quoted_net < self._config.min_profit_usd:
@@ -315,9 +315,7 @@ class Executor:
             )
             return False
 
-        logger.debug(
-            "[EXECUTOR] Quote price recheck passed | quoted_net=$%.4f", float(quoted_net)
-        )
+        logger.debug("[EXECUTOR] Quote price recheck passed | quoted_net=$%.4f", float(quoted_net))
         return True
 
     async def _execute_quote(self, quote: dict[str, Any]) -> bool:

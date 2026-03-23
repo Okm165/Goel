@@ -220,7 +220,9 @@ class DeriveClient:
                 text = raw_msg.decode("utf-8") if isinstance(raw_msg, bytes) else raw_msg
 
                 if self._last_message_time - last_log_time > THROUGHPUT_LOG_INTERVAL:
-                    logger.info("[CLIENT] Messages: %d in %.0fs", message_count, THROUGHPUT_LOG_INTERVAL)
+                    logger.info(
+                        "[CLIENT] Messages: %d in %.0fs", message_count, THROUGHPUT_LOG_INTERVAL
+                    )
                     message_count = 0
                     last_log_time = self._last_message_time
 
@@ -229,7 +231,7 @@ class DeriveClient:
                 except Exception:
                     logger.exception("[CLIENT] Error handling message")
 
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("[CLIENT] No messages received in %.0fs", recv_timeout)
                 continue
             except ConnectionClosed:
