@@ -7,12 +7,15 @@ Manages the async event loop and graceful shutdown.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import csv
+import json
 import logging
 import signal
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -22,7 +25,7 @@ from bot.evaluator import Evaluator
 from bot.executor import Executor
 from bot.orderbook import OrderBook
 from bot.risk import RiskManager
-from bot.types import Opportunity, Quote, ValidOpportunity
+from bot.types import Opportunity, Quote, RejectedOpportunity, parse_instrument
 
 if TYPE_CHECKING:
     from bot.config import Config
@@ -55,12 +58,17 @@ class Bot:
         "_csv_writer",
         "_evaluator",
         "_executor",
+        "_found_count",
         "_opportunity_queue",
         "_orderbook",
         "_quote_queue",
+        "_recent_opportunities",
+        "_rejection_counts",
         "_risk_manager",
         "_running",
+        "_start_time",
         "_tasks",
+        "_valid_count",
     )
 
     def __init__(self, config: Config) -> None:
@@ -83,6 +91,13 @@ class Bot:
         self._csv_file = None
         self._running = False
         self._tasks: list[asyncio.Task[None]] = []
+        self._found_count = 0
+        self._valid_count = 0
+        self._start_time: datetime | None = None
+        self._recent_opportunities: collections.deque[dict[str, object]] = collections.deque(
+            maxlen=50
+        )
+        self._rejection_counts: dict[str, int] = {}
 
         logger.info(
             "[BOT] Initialized | mode=%s | underlyings=%s | min_profit=$%.2f",
@@ -94,6 +109,7 @@ class Bot:
     async def run(self) -> None:
         """Run the bot until stopped."""
         self._running = True
+        self._start_time = datetime.now(UTC)
         self._setup_csv_output()
 
         mode = "EXECUTION" if self._executor else "OBSERVATION"
@@ -172,18 +188,36 @@ class Bot:
     async def _opportunity_logger(self) -> None:
         """Log opportunities to CSV (observation mode)."""
         logger.info("[OPP_LOGGER] Started in observation mode")
-        found = 0
-        validated = 0
 
         while self._running:
             try:
                 opportunity = await asyncio.wait_for(self._opportunity_queue.get(), timeout=1.0)
-                found += 1
+                self._found_count += 1
 
                 result = self._risk_manager.validate(opportunity)
 
-                if isinstance(result, ValidOpportunity):
-                    validated += 1
+                if isinstance(result, RejectedOpportunity):
+                    name = result.reason.name
+                    self._rejection_counts[name] = self._rejection_counts.get(name, 0) + 1
+                else:
+                    self._valid_count += 1
+                    legs_str = "; ".join(
+                        f"{leg.side.value} {leg.size} {leg.instrument} @ {leg.price}"
+                        for leg in opportunity.legs
+                    )
+                    self._recent_opportunities.append(
+                        {
+                            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "arb_type": opportunity.arb_type.name,
+                            "underlying": opportunity.underlying,
+                            "expiry": opportunity.expiry,
+                            "net_profit": float(opportunity.net_profit),
+                            "gross_credit": float(opportunity.gross_credit),
+                            "total_fees": float(opportunity.total_fees),
+                            "guaranteed_floor": float(opportunity.guaranteed_floor),
+                            "legs": legs_str,
+                        }
+                    )
                     self._log_opportunity(opportunity)
                     logger.info(
                         "[OPP_LOGGER] VALID | %s | %s | profit=$%.2f",
@@ -197,41 +231,128 @@ class Bot:
             except asyncio.CancelledError:
                 break
 
-        logger.info("[OPP_LOGGER] Stopped | found=%d | validated=%d", found, validated)
+        logger.info(
+            "[OPP_LOGGER] Stopped | found=%d | validated=%d",
+            self._found_count,
+            self._valid_count,
+        )
 
     async def _stats_reporter(self) -> None:
-        """Periodically report system statistics."""
+        """Periodically report system statistics and write live state file."""
         logger.info("[STATS] Reporter started")
+        cycle = 0
 
         while self._running:
-            await asyncio.sleep(30.0)
+            await asyncio.sleep(5.0)
 
             if not self._running:
                 break
 
-            expiries = {u: len(self._orderbook.get_expiries(u)) for u in self._config.underlyings}
-            index_prices = {
-                u: float(self._orderbook.get_index_price(u) or 0)
-                for u in self._config.underlyings
-            }
-            spot_prices = {
-                u: float(self._orderbook.get_spot_price(u) or 0)
-                for u in self._config.underlyings
-            }
+            cycle += 1
+            self._write_state()
 
-            logger.info(
-                "[STATS] quotes=%d | queue=%d | expiries=%s",
-                self._orderbook.quote_count,
-                self._quote_queue.qsize(),
-                expiries,
-            )
-            logger.info(
-                "[STATS] index_prices=%s | spot_prices=%s",
-                index_prices,
-                spot_prices,
-            )
+            if cycle % 6 == 0:
+                expiries = {
+                    u: len(self._orderbook.get_expiries(u)) for u in self._config.underlyings
+                }
+                index_prices = {
+                    u: float(self._orderbook.get_index_price(u) or 0)
+                    for u in self._config.underlyings
+                }
+                spot_prices = {
+                    u: float(self._orderbook.get_spot_price(u) or 0)
+                    for u in self._config.underlyings
+                }
+                logger.info(
+                    "[STATS] quotes=%d | queue=%d | expiries=%s",
+                    self._orderbook.quote_count,
+                    self._quote_queue.qsize(),
+                    expiries,
+                )
+                logger.info(
+                    "[STATS] index_prices=%s | spot_prices=%s",
+                    index_prices,
+                    spot_prices,
+                )
 
         logger.info("[STATS] Reporter stopped")
+
+    def _write_state(self) -> None:
+        """Write live bot state to JSON file for dashboard consumption."""
+        try:
+            now = datetime.now(UTC)
+            uptime_s = (now - self._start_time).total_seconds() if self._start_time else 0.0
+            underlyings = list(self._config.underlyings)
+            now_ms = int(time.time() * 1000)
+
+            # Build live quotes snapshot: top 30 options by bid-ask spread % (market anomalies)
+            quotes_snapshot: list[dict[str, object]] = []
+            for q in self._orderbook.quotes:
+                if q.bid > 0 and q.ask > 0 and q.mark > 0:
+                    spread_usd = float(q.ask - q.bid)
+                    spread_pct = spread_usd / float(q.mark) * 100
+                    info = parse_instrument(q.instrument)
+                    quotes_snapshot.append(
+                        {
+                            "instrument": q.instrument,
+                            "underlying": info.underlying if info else "",
+                            "expiry": info.expiry if info else "",
+                            "strike": float(info.strike) if info else 0.0,
+                            "type": info.option_type.value if info else "",
+                            "bid": float(q.bid),
+                            "ask": float(q.ask),
+                            "spread_usd": round(spread_usd, 4),
+                            "spread_pct": round(spread_pct, 2),
+                            "mark": float(q.mark),
+                            "iv_pct": round(float(q.iv) * 100, 1),
+                            "delta": round(float(q.delta), 3),
+                            "age_ms": now_ms - q.timestamp_ms,
+                        }
+                    )
+            quotes_snapshot.sort(
+                key=lambda x: x["spread_pct"] if isinstance(x["spread_pct"], float) else 0.0,
+                reverse=True,
+            )
+
+            state: dict[str, object] = {
+                "updated_at": now.isoformat(),
+                "start_time": self._start_time.isoformat() if self._start_time else None,
+                "uptime_s": uptime_s,
+                "mode": "EXECUTION" if self._executor else "OBSERVATION",
+                "underlyings": underlyings,
+                "min_profit_usd": float(self._config.min_profit_usd),
+                "quote_count": self._orderbook.quote_count,
+                "quote_queue_size": self._quote_queue.qsize(),
+                "opportunity_queue_size": self._opportunity_queue.qsize(),
+                "scan_count": self._evaluator.scan_count,
+                "found_count": self._found_count,
+                "valid_count": self._valid_count,
+                "index_prices": {
+                    u: float(self._orderbook.get_index_price(u) or 0) for u in underlyings
+                },
+                "spot_prices": {
+                    u: float(self._orderbook.get_spot_price(u) or 0) for u in underlyings
+                },
+                "perp_marks": {
+                    u: float(self._orderbook.get_perp_mark(u) or 0) for u in underlyings
+                },
+                "perp_funding_rates": {
+                    u: float(self._orderbook.get_perp_funding_rate(u) or 0) for u in underlyings
+                },
+                "expiry_counts": {u: len(self._orderbook.get_expiries(u)) for u in underlyings},
+                "rejection_counts": dict(self._rejection_counts),
+                "scan_history": self._evaluator.scan_history,
+                "quotes_snapshot": quotes_snapshot[:30],
+                "recent_opportunities": list(self._recent_opportunities),
+            }
+
+            state_path = Path(self._config.output_csv).with_name("bot_state.json")
+            tmp_path = state_path.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(state, indent=2))
+            tmp_path.replace(state_path)
+
+        except Exception:
+            logger.debug("[STATS] Failed to write state file", exc_info=True)
 
     def _setup_csv_output(self) -> None:
         """Initialize CSV output file."""
