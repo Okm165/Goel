@@ -83,6 +83,13 @@ class Quote:
     iv: Decimal
     delta: Decimal
     timestamp_ms: int
+    index_price: Decimal = ZERO
+    # Oracle forward price for this expiry (option_pricing.f from ticker_slim).
+    # Derive uses Black76 with r=0; this field is the market-implied forward price
+    # supplied by the Block Scholes oracle — the only correct basis for put-call parity.
+    forward_price: Decimal = ZERO
+    # Current hourly funding rate (for perp instruments; null/zero for options).
+    funding_rate: Decimal = ZERO
 
     @property
     def mid(self) -> Decimal:

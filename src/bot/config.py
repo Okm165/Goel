@@ -20,7 +20,10 @@ DEFAULT_REST_URL: Final[str] = "https://api.lyra.finance"
 DEFAULT_MIN_PROFIT_USD: Final[Decimal] = Decimal("1.00")
 DEFAULT_MAX_QUOTE_AGE_MS: Final[int] = 1000
 DEFAULT_MIN_TRADE_SIZE: Final[Decimal] = Decimal("0.1")
-DEFAULT_RISK_FREE_RATE: Final[Decimal] = Decimal("0.05")
+# Retained for backward compatibility only — no longer used by the evaluator.
+# Derive's smart contract hard-codes INTEREST_RATE = 0.00 (Black76 with r=0);
+# the option-pricing.f oracle field in ticker_slim is the correct forward price.
+DEFAULT_RISK_FREE_RATE: Final[Decimal] = Decimal("0.00")
 DEFAULT_UNDERLYINGS: Final[tuple[str, ...]] = ("ETH", "BTC")
 DEFAULT_LOG_LEVEL: Final[str] = "INFO"
 DEFAULT_OUTPUT_CSV: Final[str] = "opportunities.csv"
