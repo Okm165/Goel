@@ -1,0 +1,48 @@
+[project]
+name = "derive-hft-bot"
+version = "0.1.0"
+description = "HFT bot for Derive Protocol options arbitrage"
+requires-python = ">=3.12"
+dependencies = [
+    "websockets>=13.0",
+    "aiohttp>=3.9",
+    "eth-account>=0.13",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.8", "pyright>=1.1", "pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bot"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src" = ""
+
+[tool.uv]
+dev-dependencies = ["ruff>=0.8", "pyright>=1.1", "pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["bot"]
+required-imports = ["from __future__ import annotations"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+include = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
