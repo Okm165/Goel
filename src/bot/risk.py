@@ -66,10 +66,14 @@ class RiskManager:
                 return RejectedOpportunity(reason=reason)
 
         logger.info(
-            "[RISK] Validated | type=%s | profit=$%.2f | floor=$%.2f",
+            "[RISK] Validated | type=%s | profit=$%.2f | floor=$%.2f | "
+            "gross=$%.2f | fees=$%.2f | legs=%d",
             opportunity.arb_type.name,
             float(opportunity.net_profit),
             float(opportunity.guaranteed_floor),
+            float(opportunity.gross_credit),
+            float(opportunity.total_fees),
+            opportunity.leg_count,
         )
         return ValidOpportunity(opportunity=opportunity)
 
@@ -115,10 +119,20 @@ class RiskManager:
         return meets_threshold
 
     def _check_zero_loss(self, opp: Opportunity) -> bool:
-        """Check zero-loss constraint based on strategy type."""
+        """Check zero-loss constraint based on strategy type.
+
+        For CONVERSION/REVERSAL: guaranteed_floor = net_profit (the entry
+        credit locked in).  We verify it is strictly positive — the trade must
+        pay us at entry, not cost us.
+
+        For BOX_SPREAD: guaranteed_floor = K2-K1 (the certain expiry payoff).
+        For NEG_BUTTERFLY: guaranteed_floor = initial net credit received.
+        """
         match opp.arb_type:
             case ArbType.CONVERSION | ArbType.REVERSAL:
-                valid = opp.guaranteed_floor > ZERO
+                # net_profit is the credit received at entry after fees.
+                # guaranteed_floor == net_profit for these strategies.
+                valid = opp.net_profit > ZERO
 
             case ArbType.ZERO_COLLAR:
                 valid = opp.guaranteed_floor > ZERO and opp.net_profit >= ZERO
