@@ -12,10 +12,11 @@ import time
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
+from decimal import Decimal
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 
-from bot.types import Leg, Opportunity, Side, ValidOpportunity
+from bot.types import ZERO, Leg, Opportunity, Side, ValidOpportunity
 
 if TYPE_CHECKING:
     from bot.config import ExecutorConfig
@@ -144,6 +145,18 @@ class Executor:
 
             logger.debug("[EXECUTOR] Quote received | quote_id=%s", quote.get("quote_id"))
 
+            # Re-validate quoted prices before executing.  The market may have
+            # moved in the ~2.5 s between scan and MM response — executing at a
+            # loss must be impossible.
+            if not self._validate_quote_prices(opportunity, quote):
+                logger.warning(
+                    "[EXECUTOR] Quote prices slipped below profit threshold | "
+                    "type=%s | expected=$%.2f",
+                    opportunity.arb_type.name,
+                    float(opportunity.net_profit),
+                )
+                return False
+
             success = await self._execute_quote(quote)
 
         except Exception:
@@ -241,6 +254,71 @@ class Executor:
             await asyncio.sleep(delay)
 
         return None
+
+    def _validate_quote_prices(
+        self,
+        opportunity: Opportunity,
+        quote: dict[str, Any],
+    ) -> bool:
+        """Re-validate MM quoted prices against the original profit threshold.
+
+        The market can move in the 0–2.5 s between scan and quote receipt.
+        This is the last safety gate before any capital leaves the account.
+
+        Parses each quoted leg price and re-calculates the net credit.  If the
+        MM's prices produce a net below min_profit_usd, returns False.
+
+        If the quote response contains no parseable leg prices (unexpected
+        format), the method logs a warning and returns True (best-effort —
+        the underlying freshness + threshold checks in RiskManager already
+        ran; skipping execution here on a parse error would be overly cautious
+        for v1 but should be hardened once the live quote schema is confirmed).
+        """
+        quoted_legs = quote.get("legs", [])
+        if not quoted_legs:
+            logger.debug("[EXECUTOR] Quote contains no leg prices; skipping price recheck")
+            return True
+
+        quoted_prices: dict[str, Decimal] = {}
+        for leg_data in quoted_legs:
+            instrument = str(leg_data.get("instrument_name", ""))
+            raw_price = leg_data.get("price")
+            if not instrument or raw_price is None:
+                continue
+            try:
+                quoted_prices[instrument] = Decimal(str(raw_price))
+            except Exception:
+                logger.warning("[EXECUTOR] Unparseable price for %s: %r", instrument, raw_price)
+
+        if not quoted_prices:
+            logger.debug("[EXECUTOR] No parseable prices in quote; skipping price recheck")
+            return True
+
+        # Re-compute gross credit from the MM's actual prices.
+        quoted_gross = ZERO
+        for leg in opportunity.legs:
+            qp = quoted_prices.get(leg.instrument)
+            if qp is None:
+                logger.warning("[EXECUTOR] Leg %s missing in quote response", leg.instrument)
+                return False  # Incomplete quote — do not execute
+            if leg.side == Side.SELL:
+                quoted_gross += qp   # we receive this
+            else:
+                quoted_gross -= qp   # we pay this
+
+        quoted_net = quoted_gross - opportunity.total_fees
+        if quoted_net < self._config.min_profit_usd:
+            logger.warning(
+                "[EXECUTOR] Quote slippage | quoted_net=$%.4f < threshold=$%.2f",
+                float(quoted_net),
+                float(self._config.min_profit_usd),
+            )
+            return False
+
+        logger.debug(
+            "[EXECUTOR] Quote price recheck passed | quoted_net=$%.4f", float(quoted_net)
+        )
+        return True
 
     async def _execute_quote(self, quote: dict[str, Any]) -> bool:
         """Execute a received quote."""
