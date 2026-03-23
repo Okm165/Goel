@@ -7,6 +7,7 @@ opportunities using live order book data.
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import time
 from datetime import UTC, datetime
@@ -48,6 +49,8 @@ class Evaluator:
         "_config",
         "_opportunity_queue",
         "_orderbook",
+        "_scan_count",
+        "_scan_history",
     )
 
     def __init__(
@@ -60,12 +63,24 @@ class Evaluator:
         self._config = config
         self._orderbook = orderbook
         self._opportunity_queue = opportunity_queue
+        self._scan_count = 0
+        # Rolling window of the last 360 scans (~3 min at 0.5s interval)
+        self._scan_history: collections.deque[dict[str, object]] = collections.deque(maxlen=360)
+
+    @property
+    def scan_count(self) -> int:
+        """Total number of scans completed."""
+        return self._scan_count
+
+    @property
+    def scan_history(self) -> list[dict[str, object]]:
+        """Recent per-scan results for charting."""
+        return list(self._scan_history)
 
     async def run(self) -> None:
         """Main scanning loop - runs at fixed intervals."""
         logger.info("[EVALUATOR] Started | underlyings=%s", ",".join(self._config.underlyings))
 
-        scan_count = 0
         total_opportunities = 0
         scan_interval = 0.5
 
@@ -81,14 +96,14 @@ class Evaluator:
                 opportunities = self._scan_all()
                 scan_duration_ms = (time.monotonic() - scan_start) * 1000
 
-                scan_count += 1
+                self._scan_count += 1
 
                 if opportunities:
                     opportunities.sort(key=lambda o: o.net_profit, reverse=True)
 
                     logger.info(
                         "[EVALUATOR] Scan #%d complete | found=%d | duration=%.2fms",
-                        scan_count,
+                        self._scan_count,
                         len(opportunities),
                         scan_duration_ms,
                     )
@@ -107,10 +122,20 @@ class Evaluator:
                         except asyncio.QueueFull:
                             logger.warning("[EVALUATOR] Opportunity queue full - dropping")
                             break
-                elif scan_count % 100 == 0:
+
+                self._scan_history.append(
+                    {
+                        "ts": datetime.now(UTC).isoformat(),
+                        "scan_num": self._scan_count,
+                        "found": len(opportunities),
+                        "duration_ms": round(scan_duration_ms, 1),
+                    }
+                )
+
+                if not opportunities and self._scan_count % 100 == 0:
                     logger.debug(
                         "[EVALUATOR] Scan #%d | no opportunities | orderbook_size=%d",
-                        scan_count,
+                        self._scan_count,
                         self._orderbook.quote_count,
                     )
 
@@ -130,14 +155,13 @@ class Evaluator:
         return opportunities
 
     def _scan_conversions(self, underlying: str) -> list[Opportunity]:
-
         """Scan for Put-Call Parity violations (Conversion/Reversal).
 
         Correct formula (Derive uses Black76 with r=0 per protocol docs):
             C - P = F_oracle - K
 
         where F_oracle is the oracle-supplied forward price from option_pricing.f
-        in ticker_slim — NOT spot × e^(-r×T) with a static rate.
+        in ticker_slim -- NOT spot * e^(-r*T) with a static rate.
 
         The forward price captures the actual market carry rate implied by perpetual
         futures (BTC static funding alone is ~11%/year), which is far higher than any
@@ -228,12 +252,18 @@ class Evaluator:
                                     "C.bid=%.2f P.ask=%.2f | synth_short=%.2f | "
                                     "F=%.2f K=%.2f fwd=%.2f | "
                                     "gross=%.2f fees=%.2f net=%.2f",
-                                    underlying, strike, expiry,
-                                    float(call.bid), float(put.ask),
+                                    underlying,
+                                    strike,
+                                    expiry,
+                                    float(call.bid),
+                                    float(put.ask),
                                     float(synthetic_short),
-                                    float(forward), float(strike),
+                                    float(forward),
+                                    float(strike),
                                     float(actual_forward),
-                                    float(gross_conv), float(fees), float(net_profit),
+                                    float(gross_conv),
+                                    float(fees),
+                                    float(net_profit),
                                 )
 
                 synthetic_long = call.ask - put.bid
@@ -270,12 +300,18 @@ class Evaluator:
                                     "C.ask=%.2f P.bid=%.2f | synth_long=%.2f | "
                                     "F=%.2f K=%.2f fwd=%.2f | "
                                     "gross=%.2f fees=%.2f net=%.2f",
-                                    underlying, strike, expiry,
-                                    float(call.ask), float(put.bid),
+                                    underlying,
+                                    strike,
+                                    expiry,
+                                    float(call.ask),
+                                    float(put.bid),
                                     float(synthetic_long),
-                                    float(forward), float(strike),
+                                    float(forward),
+                                    float(strike),
                                     float(actual_forward),
-                                    float(gross_rev), float(fees), float(net_profit),
+                                    float(gross_rev),
+                                    float(fees),
+                                    float(net_profit),
                                 )
 
         return opportunities
@@ -297,7 +333,7 @@ class Evaluator:
         Fee model (source: https://docs.derive.xyz/reference/fees-1):
           Box spreads use a SPECIAL fee schedule that replaces the standard
           per-leg RFQ fees entirely:
-            box_fee = (K2 - K1) × 1% × years_to_expiry   [both sides]
+            box_fee = (K2 - K1) * 1% * years_to_expiry   [both sides]
             base_fee = $0.50                               [taker only]
           Total taker fee = box_fee + $0.50
         """
@@ -310,7 +346,7 @@ class Evaluator:
         now_ms = int(time.time() * 1000)
 
         _BOX_YIELD_RATE = Decimal("0.01")  # 1% yield spread per year (Derive docs)
-        _BOX_BASE_FEE = Decimal("0.50")    # taker-side base fee
+        _BOX_BASE_FEE = Decimal("0.50")  # taker-side base fee
 
         for expiry in self._orderbook.get_expiries(underlying):
             tte = self._time_to_expiry_years(expiry)
@@ -391,7 +427,7 @@ class Evaluator:
         """Scan for Negative-Cost Butterfly spreads (calls and puts).
 
         A negative-cost butterfly is a net credit: buy the wings (K1, K3) and
-        sell 2× the body (K2) where K1 < K2 < K3 and K2 - K1 = K3 - K2.
+        sell 2x the body (K2) where K1 < K2 < K3 and K2 - K1 = K3 - K2.
         The initial credit is the guaranteed minimum profit (payoff ≥ 0).
 
         Both call and put variants are scanned.
@@ -461,8 +497,12 @@ class Evaluator:
                                             )
                                         )
                                         logger.debug(
-                                            "[EVALUATOR] NEG_BUTTERFLY(C) | %s | strikes=%s/%s/%s | profit=$%.2f",
-                                            underlying, k1, k2, k3,
+                                            "[EVALUATOR] NEG_BUTTERFLY(C) | %s"
+                                            " | strikes=%s/%s/%s | profit=$%.2f",
+                                            underlying,
+                                            k1,
+                                            k2,
+                                            k3,
                                             float(net_profit_at_entry),
                                         )
 
@@ -506,8 +546,12 @@ class Evaluator:
                                             )
                                         )
                                         logger.debug(
-                                            "[EVALUATOR] NEG_BUTTERFLY(P) | %s | strikes=%s/%s/%s | profit=$%.2f",
-                                            underlying, k1, k2, k3,
+                                            "[EVALUATOR] NEG_BUTTERFLY(P) | %s"
+                                            " | strikes=%s/%s/%s | profit=$%.2f",
+                                            underlying,
+                                            k1,
+                                            k2,
+                                            k3,
                                             float(net_profit_p),
                                         )
 
@@ -544,11 +588,11 @@ class Evaluator:
         """Estimate total taker execution fees for a multi-leg RFQ.
 
         Fee formula per leg (source: https://docs.derive.xyz/reference/fees-1):
-          taker_fee = $0.50 + 0.03% × notional_volume
-          where notional_volume = contract_size × spot_price
+          taker_fee = $0.50 + 0.03% * notional_volume
+          where notional_volume = contract_size * spot_price
 
         Capped at 12.5% of the option's value per leg:
-          cap = 12.5% × (leg.price × leg.size)
+          cap = 12.5% * (leg.price * leg.size)
 
         Multi-leg RFQ discount (grouping: long calls / short calls /
         long puts / short puts / perps):
@@ -557,8 +601,8 @@ class Evaluator:
           - Most expensive  → full fee
         """
         _TAKER_BASE = Decimal("0.50")
-        _TAKER_RATE = Decimal("0.0003")   # 0.03% per notional
-        _OPTION_CAP = Decimal("0.125")    # 12.5% of option value
+        _TAKER_RATE = Decimal("0.0003")  # 0.03% per notional
+        _OPTION_CAP = Decimal("0.125")  # 12.5% of option value
 
         leg_fees: list[Decimal] = []
 
@@ -581,10 +625,10 @@ class Evaluator:
         leg_fees.sort()
 
         if len(leg_fees) >= 2:
-            leg_fees[0] = ZERO            # cheapest group: 100% discount
+            leg_fees[0] = ZERO  # cheapest group: 100% discount
             if len(leg_fees) >= 3:
-                leg_fees[1] *= Decimal("0.5")   # 2nd cheapest: 50% discount
+                leg_fees[1] *= Decimal("0.5")  # 2nd cheapest: 50% discount
             if len(leg_fees) >= 4:
-                leg_fees[2] *= Decimal("0.5")   # 3rd cheapest: 50% discount
+                leg_fees[2] *= Decimal("0.5")  # 3rd cheapest: 50% discount
 
         return sum(leg_fees, ZERO)
